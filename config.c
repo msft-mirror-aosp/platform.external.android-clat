@@ -35,66 +35,6 @@
 
 struct clat_config Global_Clatd_Config;
 
-/* function: config_item_str
- * locates the config item and returns the pointer to a string, or NULL on failure.  Caller frees
- * pointer
- *   root       - parsed configuration
- *   item_name  - name of config item to locate
- *   defaultvar - value to use if config item isn't present
- */
-char *config_item_str(cnode *root, const char *item_name, const char *defaultvar) {
-  const char *tmp;
-
-  if (!(tmp = config_str(root, item_name, defaultvar))) {
-    logmsg(ANDROID_LOG_FATAL, "%s config item needed", item_name);
-    return NULL;
-  }
-  return strdup(tmp);
-}
-
-/* function: config_item_int16_t
- * locates the config item, parses the integer, and returns the pointer ret_val_ptr, or NULL on
- * failure
- *   root        - parsed configuration
- *   item_name   - name of config item to locate
- *   defaultvar  - value to use if config item isn't present
- *   ret_val_ptr - pointer for return value storage
- */
-int16_t *config_item_int16_t(cnode *root, const char *item_name, const char *defaultvar,
-                             int16_t *ret_val_ptr) {
-  const char *tmp;
-  char *endptr;
-  long int conf_int;
-
-  if (!(tmp = config_str(root, item_name, defaultvar))) {
-    logmsg(ANDROID_LOG_FATAL, "%s config item needed", item_name);
-    return NULL;
-  }
-
-  errno    = 0;
-  conf_int = strtol(tmp, &endptr, 10);
-  if (errno > 0) {
-    logmsg(ANDROID_LOG_FATAL, "%s config item is not numeric: %s (error=%s)", item_name, tmp,
-           strerror(errno));
-    return NULL;
-  }
-  if (endptr == tmp || *tmp == '\0') {
-    logmsg(ANDROID_LOG_FATAL, "%s config item is not numeric: %s", item_name, tmp);
-    return NULL;
-  }
-  if (*endptr != '\0') {
-    logmsg(ANDROID_LOG_FATAL, "%s config item contains non-numeric characters: %s", item_name,
-           endptr);
-    return NULL;
-  }
-  if (conf_int > INT16_MAX || conf_int < INT16_MIN) {
-    logmsg(ANDROID_LOG_FATAL, "%s config item is too big/small: %d", item_name, conf_int);
-    return NULL;
-  }
-  *ret_val_ptr = conf_int;
-  return ret_val_ptr;
-}
-
 /* function: config_item_ip
  * locates the config item, parses the ipv4 address, and returns the pointer ret_val_ptr, or NULL on
  * failure
@@ -122,33 +62,6 @@ struct in_addr *config_item_ip(cnode *root, const char *item_name, const char *d
   return ret_val_ptr;
 }
 
-/* function: config_item_ip6
- * locates the config item, parses the ipv6 address, and returns the pointer ret_val_ptr, or NULL on
- * failure
- *   root        - parsed configuration
- *   item_name   - name of config item to locate
- *   defaultvar  - value to use if config item isn't present
- *   ret_val_ptr - pointer for return value storage
- */
-struct in6_addr *config_item_ip6(cnode *root, const char *item_name, const char *defaultvar,
-                                 struct in6_addr *ret_val_ptr) {
-  const char *tmp;
-  int status;
-
-  if (!(tmp = config_str(root, item_name, defaultvar))) {
-    logmsg(ANDROID_LOG_FATAL, "%s config item needed", item_name);
-    return NULL;
-  }
-
-  status = inet_pton(AF_INET6, tmp, ret_val_ptr);
-  if (status <= 0) {
-    logmsg(ANDROID_LOG_FATAL, "invalid IPv6 address specified for %s: %s", item_name, tmp);
-    return NULL;
-  }
-
-  return ret_val_ptr;
-}
-
 /* function: ipv6_prefix_equal
  * compares the prefixes two ipv6 addresses. assumes the prefix lengths are both /64.
  *   a1 - first address
@@ -156,107 +69,6 @@ struct in6_addr *config_item_ip6(cnode *root, const char *item_name, const char 
  *   returns: 0 if the subnets are different, 1 if they are the same.
  */
 int ipv6_prefix_equal(struct in6_addr *a1, struct in6_addr *a2) { return !memcmp(a1, a2, 8); }
-
-/* function: gen_random_iid
- * picks a random interface ID that is checksum neutral with the IPv4 address and the NAT64 prefix
- *   myaddr            - IPv6 address to write to
- *   ipv4_local_subnet - clat IPv4 address
- *   plat_subnet       - NAT64 prefix
- */
-void gen_random_iid(struct in6_addr *myaddr, struct in_addr *ipv4_local_subnet,
-                    struct in6_addr *plat_subnet) {
-  // Fill last 8 bytes of IPv6 address with random bits.
-  arc4random_buf(&myaddr->s6_addr[8], 8);
-
-  // Make the IID checksum-neutral. That is, make it so that:
-  //   checksum(Local IPv4 | Remote IPv4) = checksum(Local IPv6 | Remote IPv6)
-  // in other words (because remote IPv6 = NAT64 prefix | Remote IPv4):
-  //   checksum(Local IPv4) = checksum(Local IPv6 | NAT64 prefix)
-  // Do this by adjusting the two bytes in the middle of the IID.
-
-  uint16_t middlebytes = (myaddr->s6_addr[11] << 8) + myaddr->s6_addr[12];
-
-  uint32_t c1 = ip_checksum_add(0, ipv4_local_subnet, sizeof(*ipv4_local_subnet));
-  uint32_t c2 = ip_checksum_add(0, plat_subnet, sizeof(*plat_subnet)) +
-                ip_checksum_add(0, myaddr, sizeof(*myaddr));
-
-  uint16_t delta      = ip_checksum_adjust(middlebytes, c1, c2);
-  myaddr->s6_addr[11] = delta >> 8;
-  myaddr->s6_addr[12] = delta & 0xff;
-}
-
-// Factored out to a separate function for testability.
-int connect_is_ipv4_address_free(in_addr_t addr) {
-  int s = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
-  if (s == -1) {
-    return 0;
-  }
-
-  // Attempt to connect to the address. If the connection succeeds and getsockname returns the same
-  // the address then the address is already assigned to the system and we can't use it.
-  struct sockaddr_in sin = { .sin_family = AF_INET, .sin_addr = { addr }, .sin_port = htons(53) };
-  socklen_t len          = sizeof(sin);
-  int inuse              = connect(s, (struct sockaddr *)&sin, sizeof(sin)) == 0 &&
-              getsockname(s, (struct sockaddr *)&sin, &len) == 0 && (size_t)len >= sizeof(sin) &&
-              sin.sin_addr.s_addr == addr;
-
-  close(s);
-  return !inuse;
-}
-
-addr_free_func config_is_ipv4_address_free = connect_is_ipv4_address_free;
-
-/* function: config_select_ipv4_address
- * picks a free IPv4 address, starting from ip and trying all addresses in the prefix in order
- *   ip        - the IP address from the configuration file
- *   prefixlen - the length of the prefix from which addresses may be selected.
- *   returns: the IPv4 address, or INADDR_NONE if no addresses were available
- */
-in_addr_t config_select_ipv4_address(const struct in_addr *ip, int16_t prefixlen) {
-  in_addr_t chosen = INADDR_NONE;
-
-  // Don't accept prefixes that are too large because we scan addresses one by one.
-  if (prefixlen < 16 || prefixlen > 32) {
-    return chosen;
-  }
-
-  // All these are in host byte order.
-  in_addr_t mask       = 0xffffffff >> (32 - prefixlen) << (32 - prefixlen);
-  in_addr_t ipv4       = ntohl(ip->s_addr);
-  in_addr_t first_ipv4 = ipv4;
-  in_addr_t prefix     = ipv4 & mask;
-
-  // Pick the first IPv4 address in the pool, wrapping around if necessary.
-  // So, for example, 192.0.0.4 -> 192.0.0.5 -> 192.0.0.6 -> 192.0.0.7 -> 192.0.0.0.
-  do {
-    if (config_is_ipv4_address_free(htonl(ipv4))) {
-      chosen = htonl(ipv4);
-      break;
-    }
-    ipv4 = prefix | ((ipv4 + 1) & ~mask);
-  } while (ipv4 != first_ipv4);
-
-  return chosen;
-}
-
-/* function: config_generate_local_ipv6_subnet
- * generates the local ipv6 subnet when given the interface ip requires config.ipv6_host_id
- *   interface_ip - in: interface ip, out: local ipv6 host address
- */
-void config_generate_local_ipv6_subnet(struct in6_addr *interface_ip) {
-  int i;
-
-  if (Global_Clatd_Config.use_dynamic_iid) {
-    /* Generate a random interface ID. */
-    gen_random_iid(interface_ip, &Global_Clatd_Config.ipv4_local_subnet,
-                   &Global_Clatd_Config.plat_subnet);
-  } else {
-    /* Use the specified interface ID. */
-    for (i = 2; i < 4; i++) {
-      interface_ip->s6_addr32[i] = Global_Clatd_Config.ipv6_host_id.s6_addr32[i];
-    }
-  }
-}
 
 /* function: read_config
  * reads the config file and parses it into the global variable Global_Clatd_Config. returns 0 on
@@ -266,7 +78,6 @@ void config_generate_local_ipv6_subnet(struct in6_addr *interface_ip) {
  */
 int read_config(const char *file, const char *uplink_interface) {
   cnode *root   = config_node("", "");
-  unsigned flags;
 
   if (!root) {
     logmsg(ANDROID_LOG_FATAL, "out of memory");
@@ -288,45 +99,11 @@ int read_config(const char *file, const char *uplink_interface) {
                       &Global_Clatd_Config.ipv4_local_subnet))
     goto failed;
 
-  if (!config_item_int16_t(root, "ipv4_local_prefixlen", DEFAULT_IPV4_LOCAL_PREFIXLEN,
-                           &Global_Clatd_Config.ipv4_local_prefixlen))
-    goto failed;
-
-  if (!config_item_ip6(root, "ipv6_host_id", "::", &Global_Clatd_Config.ipv6_host_id)) goto failed;
-
-  /* In order to prevent multiple devices attempting to use the same clat address, never use a
-     statically-configured interface ID on a broadcast interface such as wifi. */
-  if (!IN6_IS_ADDR_UNSPECIFIED(&Global_Clatd_Config.ipv6_host_id)) {
-    ifc_init();
-    ifc_get_info(Global_Clatd_Config.default_pdp_interface, NULL, NULL, &flags);
-    ifc_close();
-    Global_Clatd_Config.use_dynamic_iid = (flags & IFF_BROADCAST) != 0;
-  } else {
-    Global_Clatd_Config.use_dynamic_iid = 1;
-  }
+  Global_Clatd_Config.ipv4_local_prefixlen = 29;
 
   return 1;
 
 failed:
   free(root);
   return 0;
-}
-
-/* function; dump_config
- * prints the current config
- */
-void dump_config() {
-  char charbuffer[INET6_ADDRSTRLEN];
-
-  logmsg(
-    ANDROID_LOG_DEBUG, "ipv6_local_subnet = %s",
-    inet_ntop(AF_INET6, &Global_Clatd_Config.ipv6_local_subnet, charbuffer, sizeof(charbuffer)));
-  logmsg(
-    ANDROID_LOG_DEBUG, "ipv4_local_subnet = %s",
-    inet_ntop(AF_INET, &Global_Clatd_Config.ipv4_local_subnet, charbuffer, sizeof(charbuffer)));
-  logmsg(ANDROID_LOG_DEBUG, "ipv4_local_prefixlen = %d", Global_Clatd_Config.ipv4_local_prefixlen);
-  logmsg(ANDROID_LOG_DEBUG, "plat_subnet = %s",
-         inet_ntop(AF_INET6, &Global_Clatd_Config.plat_subnet, charbuffer, sizeof(charbuffer)));
-  logmsg(ANDROID_LOG_DEBUG, "default_pdp_interface = %s",
-         Global_Clatd_Config.default_pdp_interface);
 }
