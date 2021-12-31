@@ -25,15 +25,16 @@
 #include <sys/capability.h>
 #include <unistd.h>
 
-#include <netid_client.h>  // For MARK_UNSET.
-
 #include "clatd.h"
 #include "common.h"
 #include "config.h"
 #include "logging.h"
-#include "setif.h"
 
 #define DEVICEPREFIX "v4-"
+
+// Sync MARK_UNSET from netid_client.h
+// TODO: remove MARK_UNSET definition once argument "-m" is removed.
+#define MARK_UNSET 0u
 
 /* function: stop_loop
  * signal handler: stop the event loop
@@ -51,6 +52,8 @@ void print_help() {
   printf("-6 [IPv6 address]\n");
   printf("-m [socket mark]\n");
   printf("-t [tun file descriptor number]\n");
+  printf("-r [read socket descriptor number]\n");
+  printf("-w [write socket descriptor number]\n");
 }
 
 /* function: main
@@ -60,11 +63,12 @@ int main(int argc, char **argv) {
   struct tun_data tunnel;
   int opt;
   char *uplink_interface = NULL, *plat_prefix = NULL, *mark_str = NULL;
-  char *v4_addr = NULL, *v6_addr = NULL, *tunfd_str = NULL;
+  char *v4_addr = NULL, *v6_addr = NULL, *tunfd_str = NULL, *read_sock_str = NULL,
+       *write_sock_str = NULL;
   uint32_t mark   = MARK_UNSET;
   unsigned len;
 
-  while ((opt = getopt(argc, argv, "i:p:4:6:m:t:h")) != -1) {
+  while ((opt = getopt(argc, argv, "i:p:4:6:m:t:r:w:h")) != -1) {
     switch (opt) {
       case 'i':
         uplink_interface = optarg;
@@ -83,6 +87,12 @@ int main(int argc, char **argv) {
         break;
       case 't':
         tunfd_str = optarg;
+        break;
+      case 'r':
+        read_sock_str = optarg;
+        break;
+      case 'w':
+        write_sock_str = optarg;
         break;
       case 'h':
         print_help();
@@ -112,9 +122,43 @@ int main(int argc, char **argv) {
     exit(1);
   }
 
+  if (read_sock_str != NULL && !parse_int(read_sock_str, &tunnel.read_fd6)) {
+    logmsg(ANDROID_LOG_FATAL, "invalid sock_write %s", read_sock_str);
+    exit(1);
+  }
+  if (!tunnel.read_fd6) {
+    logmsg(ANDROID_LOG_FATAL, "no read_fd6 specified on commandline.");
+    exit(1);
+  }
+
+  if (write_sock_str != NULL && !parse_int(write_sock_str, &tunnel.write_fd6)) {
+    logmsg(ANDROID_LOG_FATAL, "invalid sock_write %s", write_sock_str);
+    exit(1);
+  }
+  if (!tunnel.write_fd6) {
+    logmsg(ANDROID_LOG_FATAL, "no write_fd6 specified on commandline.");
+    exit(1);
+  }
+
   len = snprintf(tunnel.device4, sizeof(tunnel.device4), "%s%s", DEVICEPREFIX, uplink_interface);
   if (len >= sizeof(tunnel.device4)) {
     logmsg(ANDROID_LOG_FATAL, "interface name too long '%s'", tunnel.device4);
+    exit(1);
+  }
+
+  Global_Clatd_Config.native_ipv6_interface = uplink_interface;
+  if (!plat_prefix || inet_pton(AF_INET6, plat_prefix, &Global_Clatd_Config.plat_subnet) <= 0) {
+    logmsg(ANDROID_LOG_FATAL, "invalid IPv6 address specified for plat prefix: %s", plat_prefix);
+    exit(1);
+  }
+
+  if (!v4_addr || !inet_pton(AF_INET, v4_addr, &Global_Clatd_Config.ipv4_local_subnet.s_addr)) {
+    logmsg(ANDROID_LOG_FATAL, "Invalid IPv4 address %s", v4_addr);
+    exit(1);
+  }
+
+  if (!v6_addr || !inet_pton(AF_INET6, v6_addr, &Global_Clatd_Config.ipv6_local_subnet)) {
+    logmsg(ANDROID_LOG_FATAL, "Invalid source address %s", v6_addr);
     exit(1);
   }
 
@@ -122,11 +166,6 @@ int main(int argc, char **argv) {
          CLATD_VERSION, uplink_interface, mark_str ? mark_str : "(none)",
          plat_prefix ? plat_prefix : "(none)", v4_addr ? v4_addr : "(none)",
          v6_addr ? v6_addr : "(none)");
-
-  // open our raw sockets before dropping privs
-  open_sockets(&tunnel, mark);
-
-  configure_interface(uplink_interface, plat_prefix, v4_addr, v6_addr, &tunnel, mark);
 
   // run under a regular user with no capabilities
   drop_root_and_caps();
@@ -140,11 +179,6 @@ int main(int argc, char **argv) {
   event_loop(&tunnel);
 
   logmsg(ANDROID_LOG_INFO, "Shutting down clat on %s", uplink_interface);
-  del_anycast_address(tunnel.write_fd6, &Global_Clatd_Config.ipv6_local_subnet);
-
-  close(tunnel.write_fd6);
-  close(tunnel.read_fd6);
-  close(tunnel.fd4);
 
   if (running) {
     logmsg(ANDROID_LOG_INFO, "Clatd on %s waiting for SIGTERM", uplink_interface);
