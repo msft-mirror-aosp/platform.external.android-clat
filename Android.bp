@@ -32,11 +32,6 @@ cc_defaults {
         // Bug: http://b/33566695
         "-Wno-address-of-packed-member",
     ],
-
-    // For MARK_UNSET.
-    header_libs: [
-        "libnetd_client_headers"
-    ],
 }
 
 // Code used both by the daemon and by unit tests.
@@ -50,9 +45,6 @@ filegroup {
         "ipv4.c",
         "ipv6.c",
         "logging.c",
-        "netlink_callbacks.c",
-        "netlink_msg.c",
-        "setif.c",
         "translate.c",
     ],
 }
@@ -61,16 +53,18 @@ filegroup {
 cc_binary {
     name: "clatd",
     defaults: ["clatd_defaults"],
+    // TODO: remove once drop_root_and_caps() is removed.
+    header_libs: [
+        "libcutils_headers",  // for AID_CLAT
+    ],
     srcs: [
         ":clatd_common",
         "main.c"
     ],
     static_libs: [
         "libip_checksum",
-        "libnl",
     ],
     shared_libs: [
-        "libcutils",
         "liblog",
     ],
 
@@ -94,6 +88,12 @@ cc_binary {
     sanitize: {
         memtag_heap: true,
     },
+
+    apex_available: [
+        "com.android.tethering",
+        "//apex_available:platform",
+    ],
+    min_sdk_version: "30",
 }
 
 // Unit tests.
@@ -108,7 +108,6 @@ cc_test {
         "libbase",
         "libip_checksum",
         "libnetd_test_tun_interface",
-        "libnl",
     ],
     shared_libs: [
         "libcutils",
