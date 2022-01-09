@@ -53,6 +53,10 @@ filegroup {
 cc_binary {
     name: "clatd",
     defaults: ["clatd_defaults"],
+    // TODO: remove once drop_root_and_caps() is removed.
+    header_libs: [
+        "libcutils_headers",  // for AID_CLAT
+    ],
     srcs: [
         ":clatd_common",
         "main.c"
@@ -61,9 +65,12 @@ cc_binary {
         "libip_checksum",
     ],
     shared_libs: [
-        "libcutils",
         "liblog",
     ],
+
+    // Static libc++ for smaller apex size while shipping clatd in the mainline module.
+    // See b/213123047
+    stl: "libc++_static",
 
     // Only enable clang-tidy for the daemon, not the tests, because enabling it for the
     // tests substantially increases build/compile cycle times and doesn't really provide a
