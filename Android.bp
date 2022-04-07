@@ -53,10 +53,6 @@ filegroup {
 cc_binary {
     name: "clatd",
     defaults: ["clatd_defaults"],
-    // TODO: remove once drop_root_and_caps() is removed.
-    header_libs: [
-        "libcutils_headers",  // for AID_CLAT
-    ],
     srcs: [
         ":clatd_common",
         "main.c"
@@ -81,14 +77,16 @@ cc_binary {
         "-*",
         "cert-*",
         "clang-analyzer-security*",
+        // b/2043314, warnings on memcpy_s, memset_s, snprintf_s calls
+        // are blocking the migration from gnu99 to gnu11.
+        // Until those warnings are fixed, disable these checks.
+        "-clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling",
         "android-*",
     ],
-    tidy_flags: [
-        "-warnings-as-errors=clang-analyzer-security*,cert-*,android-*",
-    ],
-    // Actually not required for clatd itself. See comments in the rc file.
-    init_rc: [
-        "vendor-464xlat.rc",
+    tidy_checks_as_errors: [
+        "clang-analyzer-security*",
+        "cert-*",
+        "android-*",
     ],
     sanitize: {
         memtag_heap: true,
