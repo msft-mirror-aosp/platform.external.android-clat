@@ -35,11 +35,6 @@
 
 #define DEVICEPREFIX "v4-"
 
-/* function: stop_loop
- * signal handler: stop the event loop
- */
-static void stop_loop() { running = 0; };
-
 /* function: print_help
  * in case the user is running this on the command line
  */
@@ -148,16 +143,5 @@ int main(int argc, char **argv) {
   logmsg(ANDROID_LOG_INFO, "Shutting down clat on %s", uplink_interface);
   del_anycast_address(tunnel.write_fd6, &Global_Clatd_Config.ipv6_local_subnet);
 
-  close(tunnel.write_fd6);
-  close(tunnel.read_fd6);
-  close(tunnel.fd4);
-
-  if (running) {
-    logmsg(ANDROID_LOG_INFO, "Clatd on %s waiting for SIGTERM", uplink_interface);
-    while (running) sleep(60);
-    logmsg(ANDROID_LOG_INFO, "Clatd on %s received SIGTERM", uplink_interface);
-  } else {
-    logmsg(ANDROID_LOG_INFO, "Clatd on %s already received SIGTERM", uplink_interface);
-  }
   return 0;
 }

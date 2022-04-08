@@ -21,7 +21,6 @@
 
 #include <arpa/inet.h>
 #include <linux/icmp.h>
-#include <linux/if_tun.h>
 #include <netinet/icmp6.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
@@ -34,7 +33,6 @@
 
 #include "clatd.h"
 #include "debug.h"
-#include "dump.h"
 #include "logging.h"
 
 #if CLAT_DEBUG
