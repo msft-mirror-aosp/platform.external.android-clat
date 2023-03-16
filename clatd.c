@@ -36,6 +36,7 @@
 #include <linux/if_ether.h>
 #include <linux/if_packet.h>
 #include <linux/if_tun.h>
+#include <linux/virtio_net.h>
 #include <net/if.h>
 #include <sys/uio.h>
 
@@ -77,14 +78,18 @@ int ipv6_address_changed(const char *interface) {
   }
 }
 
-// reads L3 IPv6 packet from AF_PACKET socket, translates to IPv4, writes to tun
+// reads IPv6 packet from AF_PACKET socket, translates to IPv4, writes to tun
 void process_packet_6_to_4(struct tun_data *tunnel) {
   // ethernet header is 14 bytes, plus 4 for a normal VLAN tag or 8 for Q-in-Q
   // we don't really support vlans (or especially Q-in-Q)...
   // but a few bytes of extra buffer space doesn't hurt...
-  uint8_t buf[22 + MAXMTU + 1];  // +1 to make packet truncation obvious
+  struct {
+    struct virtio_net_hdr vnet;
+    uint8_t payload[22 + MAXMTU];
+    char pad; // +1 to make packet truncation obvious
+  } buf;
   struct iovec iov = {
-    .iov_base = buf,
+    .iov_base = &buf,
     .iov_len = sizeof(buf),
   };
   char cmsg_buf[CMSG_SPACE(sizeof(struct tpacket_auxdata))];
@@ -122,7 +127,7 @@ void process_packet_6_to_4(struct tun_data *tunnel) {
     }
   }
 
-  if (readlen < tp_net) {
+  if (readlen < sizeof(struct virtio_net_hdr) + tp_net) {
     logmsg(ANDROID_LOG_WARN, "%s: ignoring %zd byte pkt shorter than %u L2 header",
            __func__, readlen, tp_net);
     return;
@@ -137,13 +142,17 @@ void process_packet_6_to_4(struct tun_data *tunnel) {
     }
   }
 
-  translate_packet(tunnel->fd4, 0 /* to_ipv6 */, buf + tp_net, readlen - tp_net);
+  translate_packet(tunnel->fd4, 0 /* to_ipv6 */, buf.payload + tp_net, readlen - sizeof(struct virtio_net_hdr) - tp_net);
 }
 
 // reads TUN_PI + L3 IPv4 packet from tun, translates to IPv6, writes to AF_INET6/RAW socket
 void process_packet_4_to_6(struct tun_data *tunnel) {
-  uint8_t buf[sizeof(struct tun_pi) + MAXMTU + 1]; // +1 to make packet truncation obvious
-  ssize_t readlen = read(tunnel->fd4, buf, sizeof(buf));
+  struct {
+    struct tun_pi pi;
+    uint8_t payload[MAXMTU];
+    char pad; // +1 byte to make packet truncation obvious
+  } buf;
+  ssize_t readlen = read(tunnel->fd4, &buf, sizeof(buf));
 
   if (readlen < 0) {
     if (errno != EAGAIN) {
@@ -159,25 +168,23 @@ void process_packet_4_to_6(struct tun_data *tunnel) {
     return;
   }
 
-  struct tun_pi *tun_header = (struct tun_pi *)buf;
-  if (readlen < (ssize_t)sizeof(*tun_header)) {
+  if (readlen < (ssize_t)sizeof(buf.pi)) {
     logmsg(ANDROID_LOG_WARN, "%s: short read: got %ld bytes", __func__, readlen);
     return;
   }
 
-  uint16_t proto = ntohs(tun_header->proto);
+  uint16_t proto = ntohs(buf.pi.proto);
   if (proto != ETH_P_IP) {
     logmsg(ANDROID_LOG_WARN, "%s: unknown packet type = 0x%x", __func__, proto);
     return;
   }
 
-  if (tun_header->flags != 0) {
-    logmsg(ANDROID_LOG_WARN, "%s: unexpected flags = %d", __func__, tun_header->flags);
+  if (buf.pi.flags != 0) {
+    logmsg(ANDROID_LOG_WARN, "%s: unexpected flags = %d", __func__, buf.pi.flags);
   }
 
-  uint8_t *packet = (uint8_t *)(tun_header + 1);
-  readlen -= sizeof(*tun_header);
-  translate_packet(tunnel->write_fd6, 1 /* to_ipv6 */, packet, readlen);
+  readlen -= sizeof(buf.pi);
+  translate_packet(tunnel->write_fd6, 1 /* to_ipv6 */, buf.payload, readlen);
 }
 
 // IPv6 DAD packet format:
