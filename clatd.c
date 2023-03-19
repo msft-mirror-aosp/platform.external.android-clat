@@ -44,36 +44,12 @@
 #include "checksum.h"
 #include "config.h"
 #include "dump.h"
-#include "getaddr.h"
 #include "logging.h"
 #include "translate.h"
 
 struct clat_config Global_Clatd_Config;
 
 volatile sig_atomic_t running = 1;
-
-int ipv6_address_changed(const char *interface) {
-  union anyip *interface_ip;
-
-  interface_ip = getinterface_ip(interface, AF_INET6);
-  if (!interface_ip) {
-    logmsg(ANDROID_LOG_ERROR, "Unable to find an IPv6 address on interface %s", interface);
-    return 1;
-  }
-
-  if (!ipv6_prefix_equal(&interface_ip->ip6, &Global_Clatd_Config.ipv6_local_subnet)) {
-    char oldstr[INET6_ADDRSTRLEN];
-    char newstr[INET6_ADDRSTRLEN];
-    inet_ntop(AF_INET6, &Global_Clatd_Config.ipv6_local_subnet, oldstr, sizeof(oldstr));
-    inet_ntop(AF_INET6, &interface_ip->ip6, newstr, sizeof(newstr));
-    logmsg(ANDROID_LOG_INFO, "IPv6 prefix on %s changed: %s -> %s", interface, oldstr, newstr);
-    free(interface_ip);
-    return 1;
-  } else {
-    free(interface_ip);
-    return 0;
-  }
-}
 
 // reads IPv6 packet from AF_PACKET socket, translates to IPv4, writes to tun
 void process_packet_6_to_4(struct tun_data *tunnel) {
@@ -124,22 +100,41 @@ void process_packet_6_to_4(struct tun_data *tunnel) {
     }
   }
 
-  if (readlen < sizeof(struct virtio_net_hdr) + tp_net) {
-    logmsg(ANDROID_LOG_WARN, "%s: ignoring %zd byte pkt shorter than %u L2 header",
-           __func__, readlen, tp_net);
+  const int payload_offset = offsetof(typeof(buf), payload);
+  if (readlen < payload_offset + tp_net) {
+    logmsg(ANDROID_LOG_WARN, "%s: ignoring %zd byte pkt shorter than %d+%u L2 header",
+           __func__, readlen, payload_offset, tp_net);
     return;
   }
+
+  const int pkt_len = readlen - payload_offset;
 
   // This will detect a skb->ip_summed == CHECKSUM_PARTIAL packet with non-final L4 checksum
   if (tp_status & TP_STATUS_CSUMNOTREADY) {
     static bool logged = false;
     if (!logged) {
-      logmsg(ANDROID_LOG_WARN, "read_packet checksum not ready");
+      logmsg(ANDROID_LOG_WARN, "%s: L4 checksum calculation required", __func__);
       logged = true;
+    }
+
+    // These are non-negative by virtue of csum_start/offset being u16
+    const int cs_start = buf.vnet.csum_start;
+    const int cs_offset = cs_start + buf.vnet.csum_offset;
+    if (cs_start > pkt_len) {
+      logmsg(ANDROID_LOG_ERROR, "%s: out of range - checksum start %d > %d",
+             __func__, cs_start, pkt_len);
+    } else if (cs_offset + 1 >= pkt_len) {
+      logmsg(ANDROID_LOG_ERROR, "%s: out of range - checksum offset %d + 1 >= %d",
+             __func__, cs_offset, pkt_len);
+    } else {
+      uint16_t csum = ip_checksum(buf.payload + cs_start, pkt_len - cs_start);
+      if (!csum) csum = 0xFFFF;  // required fixup for UDP, TCP must live with it
+      buf.payload[cs_offset] = csum & 0xFF;
+      buf.payload[cs_offset + 1] = csum >> 8;
     }
   }
 
-  translate_packet(tunnel->fd4, 0 /* to_ipv6 */, buf.payload + tp_net, readlen - sizeof(struct virtio_net_hdr) - tp_net);
+  translate_packet(tunnel->fd4, 0 /* to_ipv6 */, buf.payload + tp_net, pkt_len - tp_net);
 }
 
 // reads TUN_PI + L3 IPv4 packet from tun, translates to IPv6, writes to AF_INET6/RAW socket
@@ -165,10 +160,14 @@ void process_packet_4_to_6(struct tun_data *tunnel) {
     return;
   }
 
-  if (readlen < (ssize_t)sizeof(buf.pi)) {
+  const int payload_offset = offsetof(typeof(buf), payload);
+
+  if (readlen < payload_offset) {
     logmsg(ANDROID_LOG_WARN, "%s: short read: got %ld bytes", __func__, readlen);
     return;
   }
+
+  const int pkt_len = readlen - payload_offset;
 
   uint16_t proto = ntohs(buf.pi.proto);
   if (proto != ETH_P_IP) {
@@ -180,8 +179,7 @@ void process_packet_4_to_6(struct tun_data *tunnel) {
     logmsg(ANDROID_LOG_WARN, "%s: unexpected flags = %d", __func__, buf.pi.flags);
   }
 
-  readlen -= sizeof(buf.pi);
-  translate_packet(tunnel->write_fd6, 1 /* to_ipv6 */, buf.payload, readlen);
+  translate_packet(tunnel->write_fd6, 1 /* to_ipv6 */, buf.payload, pkt_len);
 }
 
 // IPv6 DAD packet format:
@@ -275,17 +273,13 @@ void event_loop(struct tun_data *tunnel) {
   // TODO: actually perform true DAD
   send_dad(tunnel->write_fd6, &Global_Clatd_Config.ipv6_local_subnet);
 
-  time_t last_interface_poll;
   struct pollfd wait_fd[] = {
     { tunnel->read_fd6, POLLIN, 0 },
     { tunnel->fd4, POLLIN, 0 },
   };
 
-  // start the poll timer
-  last_interface_poll = time(NULL);
-
   while (running) {
-    if (poll(wait_fd, ARRAY_SIZE(wait_fd), NO_TRAFFIC_INTERFACE_POLL_FREQUENCY * 1000) == -1) {
+    if (poll(wait_fd, ARRAY_SIZE(wait_fd), -1) == -1) {
       if (errno != EINTR) {
         logmsg(ANDROID_LOG_WARN, "event_loop/poll returned an error: %s", strerror(errno));
       }
@@ -297,14 +291,6 @@ void event_loop(struct tun_data *tunnel) {
       // socket error flag instead.
       if (wait_fd[0].revents) process_packet_6_to_4(tunnel);
       if (wait_fd[1].revents) process_packet_4_to_6(tunnel);
-    }
-
-    time_t now = time(NULL);
-    if (now >= (last_interface_poll + INTERFACE_POLL_FREQUENCY)) {
-      last_interface_poll = now;
-      if (ipv6_address_changed(Global_Clatd_Config.native_ipv6_interface)) {
-        break;
-      }
     }
   }
 }
