@@ -38,28 +38,22 @@ struct tun_data;
 //
 // (since there's no jumbogram support in IPv4, IPv6 jumbograms cannot be meaningfully
 // converted to IPv4 anyway, and are thus entirely unsupported)
-//
-// We bump it by one more, since it makes truncation more obvious.
-// ie. if we ever read >= MAXMTU bytes we should discard.
-#define MAXMTU (0xFFFF + 28 + 1)
-#define PACKETLEN (sizeof(struct tun_pi) + MAXMTU)
+#define MAXMTU (0xFFFF + 28)
 
-// logcat_hexdump() maximum binary data length
-#define MAXDUMPLEN PACKETLEN
+// logcat_hexdump() maximum binary data length, this is the maximum packet size
+// plus some extra space for various headers:
+//   struct tun_pi (4 bytes)
+//   struct virtio_net_hdr (10 bytes)
+//   ethernet (14 bytes), potentially including vlan tag (4) or tags (8 or 12)
+// plus some extra just-in-case headroom, because it doesn't hurt.
+#define MAXDUMPLEN (64 + MAXMTU)
 
-#define CLATD_VERSION "1.6"
+#define CLATD_VERSION "1.7"
 
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 
-// how frequently (in seconds) to poll for an address change while traffic is passing
-#define INTERFACE_POLL_FREQUENCY 30
-
-// how frequently (in seconds) to poll for an address change while there is no traffic
-#define NO_TRAFFIC_INTERFACE_POLL_FREQUENCY 90
-
 extern volatile sig_atomic_t running;
 
-int ipv6_address_changed(const char *interface);
 void event_loop(struct tun_data *tunnel);
 
 /* function: parse_int
