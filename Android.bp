@@ -40,7 +40,6 @@ filegroup {
     srcs: [
         "clatd.c",
         "dump.c",
-        "getaddr.c",
         "icmp.c",
         "ipv4.c",
         "ipv6.c",
@@ -88,9 +87,6 @@ cc_binary {
         "cert-*",
         "android-*",
     ],
-    sanitize: {
-        memtag_heap: true,
-    },
 
     apex_available: [
         "com.android.tethering",
