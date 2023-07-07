@@ -20,6 +20,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,6 +36,7 @@
 #include <linux/if_ether.h>
 #include <linux/if_packet.h>
 #include <linux/if_tun.h>
+#include <linux/virtio_net.h>
 #include <net/if.h>
 #include <sys/uio.h>
 
@@ -42,85 +44,153 @@
 #include "checksum.h"
 #include "config.h"
 #include "dump.h"
-#include "getaddr.h"
 #include "logging.h"
 #include "translate.h"
 
 struct clat_config Global_Clatd_Config;
 
-/* 40 bytes IPv6 header - 20 bytes IPv4 header + 8 bytes fragment header */
-#define MTU_DELTA 28
-
 volatile sig_atomic_t running = 1;
 
-int ipv6_address_changed(const char *interface) {
-  union anyip *interface_ip;
-
-  interface_ip = getinterface_ip(interface, AF_INET6);
-  if (!interface_ip) {
-    logmsg(ANDROID_LOG_ERROR, "Unable to find an IPv6 address on interface %s", interface);
-    return 1;
-  }
-
-  if (!ipv6_prefix_equal(&interface_ip->ip6, &Global_Clatd_Config.ipv6_local_subnet)) {
-    char oldstr[INET6_ADDRSTRLEN];
-    char newstr[INET6_ADDRSTRLEN];
-    inet_ntop(AF_INET6, &Global_Clatd_Config.ipv6_local_subnet, oldstr, sizeof(oldstr));
-    inet_ntop(AF_INET6, &interface_ip->ip6, newstr, sizeof(newstr));
-    logmsg(ANDROID_LOG_INFO, "IPv6 prefix on %s changed: %s -> %s", interface, oldstr, newstr);
-    free(interface_ip);
-    return 1;
-  } else {
-    free(interface_ip);
-    return 0;
-  }
-}
-
-/* function: read_packet
- * reads a packet from the tunnel fd and translates it
- *   read_fd  - file descriptor to read original packet from
- *   write_fd - file descriptor to write translated packet to
- *   to_ipv6  - whether the packet is to be translated to ipv6 or ipv4
- */
-void read_packet(int read_fd, int write_fd, int to_ipv6) {
-  uint8_t buf[PACKETLEN];
-  ssize_t readlen = read(read_fd, buf, PACKETLEN);
+// reads IPv6 packet from AF_PACKET socket, translates to IPv4, writes to tun
+void process_packet_6_to_4(struct tun_data *tunnel) {
+  // ethernet header is 14 bytes, plus 4 for a normal VLAN tag or 8 for Q-in-Q
+  // we don't really support vlans (or especially Q-in-Q)...
+  // but a few bytes of extra buffer space doesn't hurt...
+  struct {
+    struct virtio_net_hdr vnet;
+    uint8_t payload[22 + MAXMTU];
+    char pad; // +1 to make packet truncation obvious
+  } buf;
+  struct iovec iov = {
+    .iov_base = &buf,
+    .iov_len = sizeof(buf),
+  };
+  char cmsg_buf[CMSG_SPACE(sizeof(struct tpacket_auxdata))];
+  struct msghdr msgh = {
+    .msg_iov = &iov,
+    .msg_iovlen = 1,
+    .msg_control = cmsg_buf,
+    .msg_controllen = sizeof(cmsg_buf),
+  };
+  ssize_t readlen = recvmsg(tunnel->read_fd6, &msgh, /*flags*/ 0);
 
   if (readlen < 0) {
     if (errno != EAGAIN) {
-      logmsg(ANDROID_LOG_WARN, "read_packet/read error: %s", strerror(errno));
+      logmsg(ANDROID_LOG_WARN, "%s: read error: %s", __func__, strerror(errno));
     }
     return;
   } else if (readlen == 0) {
-    logmsg(ANDROID_LOG_WARN, "read_packet/tun interface removed");
+    logmsg(ANDROID_LOG_WARN, "%s: packet socket removed?", __func__);
     running = 0;
     return;
-  }
-
-  if (!to_ipv6) {
-    translate_packet(write_fd, 0 /* to_ipv6 */, buf, readlen);
+  } else if (readlen >= sizeof(buf)) {
+    logmsg(ANDROID_LOG_WARN, "%s: read truncation - ignoring pkt", __func__);
     return;
   }
 
-  struct tun_pi *tun_header = (struct tun_pi *)buf;
-  if (readlen < (ssize_t)sizeof(*tun_header)) {
-    logmsg(ANDROID_LOG_WARN, "read_packet/short read: got %ld bytes", readlen);
+  bool ok = false;
+  __u32 tp_status = 0;
+  __u16 tp_net = 0;
+
+  for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msgh); cmsg != NULL; cmsg = CMSG_NXTHDR(&msgh,cmsg)) {
+    if (cmsg->cmsg_level == SOL_PACKET && cmsg->cmsg_type == PACKET_AUXDATA) {
+      struct tpacket_auxdata *aux = (struct tpacket_auxdata *)CMSG_DATA(cmsg);
+      ok = true;
+      tp_status = aux->tp_status;
+      tp_net = aux->tp_net;
+      break;
+    }
+  }
+
+  if (!ok) {
+    // theoretically this should not happen...
+    static bool logged = false;
+    if (!logged) {
+      logmsg(ANDROID_LOG_ERROR, "%s: failed to fetch tpacket_auxdata cmsg", __func__);
+      logged = true;
+    }
+  }
+
+  const int payload_offset = offsetof(typeof(buf), payload);
+  if (readlen < payload_offset + tp_net) {
+    logmsg(ANDROID_LOG_WARN, "%s: ignoring %zd byte pkt shorter than %d+%u L2 header",
+           __func__, readlen, payload_offset, tp_net);
     return;
   }
 
-  uint16_t proto = ntohs(tun_header->proto);
+  const int pkt_len = readlen - payload_offset;
+
+  // This will detect a skb->ip_summed == CHECKSUM_PARTIAL packet with non-final L4 checksum
+  if (tp_status & TP_STATUS_CSUMNOTREADY) {
+    static bool logged = false;
+    if (!logged) {
+      logmsg(ANDROID_LOG_WARN, "%s: L4 checksum calculation required", __func__);
+      logged = true;
+    }
+
+    // These are non-negative by virtue of csum_start/offset being u16
+    const int cs_start = buf.vnet.csum_start;
+    const int cs_offset = cs_start + buf.vnet.csum_offset;
+    if (cs_start > pkt_len) {
+      logmsg(ANDROID_LOG_ERROR, "%s: out of range - checksum start %d > %d",
+             __func__, cs_start, pkt_len);
+    } else if (cs_offset + 1 >= pkt_len) {
+      logmsg(ANDROID_LOG_ERROR, "%s: out of range - checksum offset %d + 1 >= %d",
+             __func__, cs_offset, pkt_len);
+    } else {
+      uint16_t csum = ip_checksum(buf.payload + cs_start, pkt_len - cs_start);
+      if (!csum) csum = 0xFFFF;  // required fixup for UDP, TCP must live with it
+      buf.payload[cs_offset] = csum & 0xFF;
+      buf.payload[cs_offset + 1] = csum >> 8;
+    }
+  }
+
+  translate_packet(tunnel->fd4, 0 /* to_ipv6 */, buf.payload + tp_net, pkt_len - tp_net);
+}
+
+// reads TUN_PI + L3 IPv4 packet from tun, translates to IPv6, writes to AF_INET6/RAW socket
+void process_packet_4_to_6(struct tun_data *tunnel) {
+  struct {
+    struct tun_pi pi;
+    uint8_t payload[MAXMTU];
+    char pad; // +1 byte to make packet truncation obvious
+  } buf;
+  ssize_t readlen = read(tunnel->fd4, &buf, sizeof(buf));
+
+  if (readlen < 0) {
+    if (errno != EAGAIN) {
+      logmsg(ANDROID_LOG_WARN, "%s: read error: %s", __func__, strerror(errno));
+    }
+    return;
+  } else if (readlen == 0) {
+    logmsg(ANDROID_LOG_WARN, "%s: tun interface removed", __func__);
+    running = 0;
+    return;
+  } else if (readlen >= sizeof(buf)) {
+    logmsg(ANDROID_LOG_WARN, "%s: read truncation - ignoring pkt", __func__);
+    return;
+  }
+
+  const int payload_offset = offsetof(typeof(buf), payload);
+
+  if (readlen < payload_offset) {
+    logmsg(ANDROID_LOG_WARN, "%s: short read: got %ld bytes", __func__, readlen);
+    return;
+  }
+
+  const int pkt_len = readlen - payload_offset;
+
+  uint16_t proto = ntohs(buf.pi.proto);
   if (proto != ETH_P_IP) {
     logmsg(ANDROID_LOG_WARN, "%s: unknown packet type = 0x%x", __func__, proto);
     return;
   }
 
-  if (tun_header->flags != 0) {
-    logmsg(ANDROID_LOG_WARN, "%s: unexpected flags = %d", __func__, tun_header->flags);
+  if (buf.pi.flags != 0) {
+    logmsg(ANDROID_LOG_WARN, "%s: unexpected flags = %d", __func__, buf.pi.flags);
   }
 
-  uint8_t *packet = (uint8_t *)(tun_header + 1);
-  readlen -= sizeof(*tun_header);
-  translate_packet(write_fd, 1 /* to_ipv6 */, packet, readlen);
+  translate_packet(tunnel->write_fd6, 1 /* to_ipv6 */, buf.payload, pkt_len);
 }
 
 // IPv6 DAD packet format:
@@ -214,36 +284,24 @@ void event_loop(struct tun_data *tunnel) {
   // TODO: actually perform true DAD
   send_dad(tunnel->write_fd6, &Global_Clatd_Config.ipv6_local_subnet);
 
-  time_t last_interface_poll;
   struct pollfd wait_fd[] = {
     { tunnel->read_fd6, POLLIN, 0 },
     { tunnel->fd4, POLLIN, 0 },
   };
 
-  // start the poll timer
-  last_interface_poll = time(NULL);
-
   while (running) {
-    if (poll(wait_fd, ARRAY_SIZE(wait_fd), NO_TRAFFIC_INTERFACE_POLL_FREQUENCY * 1000) == -1) {
+    if (poll(wait_fd, ARRAY_SIZE(wait_fd), -1) == -1) {
       if (errno != EINTR) {
         logmsg(ANDROID_LOG_WARN, "event_loop/poll returned an error: %s", strerror(errno));
       }
     } else {
-      // Call read_packet if the socket has data to be read, but also if an
+      // Call process_packet if the socket has data to be read, but also if an
       // error is waiting. If we don't call read() after getting POLLERR, a
       // subsequent poll() will return immediately with POLLERR again,
       // causing this code to spin in a loop. Calling read() will clear the
       // socket error flag instead.
-      if (wait_fd[0].revents) read_packet(tunnel->read_fd6, tunnel->fd4, 0 /* to_ipv6 */);
-      if (wait_fd[1].revents) read_packet(tunnel->fd4, tunnel->write_fd6, 1 /* to_ipv6 */);
-    }
-
-    time_t now = time(NULL);
-    if (now >= (last_interface_poll + INTERFACE_POLL_FREQUENCY)) {
-      last_interface_poll = now;
-      if (ipv6_address_changed(Global_Clatd_Config.native_ipv6_interface)) {
-        break;
-      }
+      if (wait_fd[0].revents) process_packet_6_to_4(tunnel);
+      if (wait_fd[1].revents) process_packet_4_to_6(tunnel);
     }
   }
 }
